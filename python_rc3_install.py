@@ -19,6 +19,8 @@ so PATH `python --version` reports the new build (/usr/local/bin precedes
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import hashlib
 import json
 import logging
@@ -40,6 +42,7 @@ BASE_URL = "https://github.com"
 ASSET = f"dusky-python-{VERSION}-{ARCH_TAG}.tar.gz"
 PREFIX = Path("/usr/local")
 MARKER = PREFIX / "lib" / "dusky-python.json"
+LOCKFILE = Path("/tmp/dusky-python-install.lock")
 SYSTEM_PYTHON = Path("/usr/bin/python3")
 WANT_BIN = PREFIX / "bin" / "python3.15"
 # PATH-shadow: /usr/local/bin precedes /usr/bin on Arch, so these two
@@ -210,6 +213,56 @@ def manifest(staging_usr_local: Path) -> list[str]:
     return sorted(rels, reverse=True) + sorted(dirs, reverse=True)
 
 
+@contextlib.contextmanager
+def install_lock():
+    """Serialize install/uninstall; concurrent runs exit instead of interleaving."""
+    try:
+        fh = LOCKFILE.open("w")
+    except OSError as exc:
+        die(f"Cannot create lock file {LOCKFILE}: {exc}")
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die("Another dusky-python install/uninstall is already running.")
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def system_version() -> tuple[int, int]:
+    try:
+        r = subprocess.run(
+            [str(SYSTEM_PYTHON), "-c",
+             "import sys; print(sys.version_info[0], sys.version_info[1])"],
+            capture_output=True, text=True, timeout=30,
+        )
+        major, minor = r.stdout.strip().split()
+        return int(major), int(minor)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return (0, 0)
+
+
+def ensure_system_interpreter() -> None:
+    """Never mutate the tree of the interpreter running this script.
+
+    If invoked via the dusky shadow (sys.executable under /usr/local),
+    re-exec on the system python first; uninstalling our own stdlib
+    mid-run breaks codecs/network in confusing ways.
+    """
+    try:
+        exe = Path(sys.executable).resolve()
+    except OSError:
+        return
+    if PREFIX not in exe.parents:
+        return
+    if not SYSTEM_PYTHON.exists():
+        die(f"Refusing: running on {exe} and system python is missing.")
+    log.info("Re-executing on system python %s...", SYSTEM_PYTHON)
+    os.execv(str(SYSTEM_PYTHON), [str(SYSTEM_PYTHON), *sys.argv])
+
+
 def cmd_check(_args: argparse.Namespace) -> int:
     state = current_state()
     print(f"system_python_ok: {system_python_ok()} ({SYSTEM_PYTHON})")
@@ -279,10 +332,16 @@ def shadow_active() -> bool:
 
 
 def cmd_install(args: argparse.Namespace) -> int:
+    ensure_system_interpreter()
     if not is_arch():
         die("Refusing: this installer is Arch Linux only.")
     if not system_python_ok():
         die(f"Refusing: system python {SYSTEM_PYTHON} is broken or missing.")
+    if system_version() >= (3, 15):
+        log.warning(
+            "System python is already 3.15+ (official repo). "
+            "You probably want `--undo` + pacman instead of this RC."
+        )
     state = current_state()
     if state.installed and not args.reinstall:
         # Converge shadow state even on no-op (flag may differ from last run).
@@ -309,130 +368,134 @@ def cmd_install(args: argparse.Namespace) -> int:
     if not system_python_ok():  # re-check after elevation
         die(f"Refusing: system python {SYSTEM_PYTHON} is broken or missing.")
 
-    tmp = Path(tempfile.mkdtemp(prefix="dusky-python-"))
-    try:
-        check_staging_space(tmp)
-        url = asset_url(args.tag, args.repo, args.base_url)
-        tarball = tmp / ASSET
-        download(url, tarball)
-        expected = args.checksum or fetch_expected_sha256(url)
-        verify(tarball, expected)
+    with install_lock():
 
-        stage = tmp / "stage"
-        stage.mkdir()
-        log.info("Extracting...")
-        with tarfile.open(tarball, "r:gz") as tar:
-            tar.extractall(stage, filter="data")  # py3.12+: no tar-slip
-        src = stage / "usr" / "local"
-        if not (src / "bin" / "python3.15").exists():
-            die(f"Bad tarball layout: {src}/bin/python3.15 missing.")
+        tmp = Path(tempfile.mkdtemp(prefix="dusky-python-"))
+        try:
+            check_staging_space(tmp)
+            url = asset_url(args.tag, args.repo, args.base_url)
+            tarball = tmp / ASSET
+            download(url, tarball)
+            expected = args.checksum or fetch_expected_sha256(url)
+            verify(tarball, expected)
 
-        log.info("Copying into %s...", PREFIX)
-        files = manifest(src)
-        for rel in files:
-            s, d = src / rel, PREFIX / rel
-            if s.is_symlink() or s.is_file():
-                d.parent.mkdir(parents=True, exist_ok=True)
-                if d.is_symlink() or d.exists():
-                    d.unlink()
-                if s.is_symlink():
-                    d.symlink_to(os.readlink(s))
-                else:
-                    shutil.copy2(s, d)
-            elif s.is_dir():
-                d.mkdir(parents=True, exist_ok=True)
+            stage = tmp / "stage"
+            stage.mkdir()
+            log.info("Extracting...")
+            with tarfile.open(tarball, "r:gz") as tar:
+                tar.extractall(stage, filter="data")  # py3.12+: no tar-slip
+            src = stage / "usr" / "local"
+            if not (src / "bin" / "python3.15").exists():
+                die(f"Bad tarball layout: {src}/bin/python3.15 missing.")
 
-        if args.no_default:
-            shadow_state = {"links": [], "backed_up": {}}
-        else:
-            shadow_state = apply_shadow()
-        MARKER.write_text(json.dumps({
-            "version": VERSION, "arch": ARCH_TAG, "repo": args.repo,
-            "tag": args.tag, "asset": ASSET, "asset_sha256": sha256_of(tarball),
-            "files": files, "shadow": shadow_state,
-        }, indent=2))
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+            log.info("Copying into %s...", PREFIX)
+            files = manifest(src)
+            for rel in files:
+                s, d = src / rel, PREFIX / rel
+                if s.is_symlink() or s.is_file():
+                    d.parent.mkdir(parents=True, exist_ok=True)
+                    if d.is_symlink() or d.exists():
+                        d.unlink()
+                    if s.is_symlink():
+                        d.symlink_to(os.readlink(s))
+                    else:
+                        shutil.copy2(s, d)
+                elif s.is_dir():
+                    d.mkdir(parents=True, exist_ok=True)
 
-    # Post-install verification; system python must still work.
-    if probe_bin() != VERSION:
-        die("Install verification failed: /usr/local/bin/python3.15 wrong version.")
-    if not args.no_default:
-        r = subprocess.run(
-            ["python", "--version"],
-            capture_output=True, text=True, timeout=30,
+            if args.no_default:
+                shadow_state = {"links": [], "backed_up": {}}
+            else:
+                shadow_state = apply_shadow()
+            MARKER.write_text(json.dumps({
+                "version": VERSION, "arch": ARCH_TAG, "repo": args.repo,
+                "tag": args.tag, "asset": ASSET, "asset_sha256": sha256_of(tarball),
+                "files": files, "shadow": shadow_state,
+            }, indent=2))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+        # Post-install verification; system python must still work.
+        if probe_bin() != VERSION:
+            die("Install verification failed: /usr/local/bin/python3.15 wrong version.")
+        if not args.no_default:
+            r = subprocess.run(
+                ["python", "--version"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if VERSION not in (r.stdout or r.stderr):
+                die("Install verification failed: PATH `python` is not the new build. "
+                    "Is /usr/local/bin before /usr/bin in PATH?")
+        smoke = subprocess.run(
+            [str(WANT_BIN), "-c", "import ssl,sqlite3,lzma; print('smoke ok')"],
+            capture_output=True, text=True, timeout=60,
         )
-        if VERSION not in (r.stdout or r.stderr):
-            die("Install verification failed: PATH `python` is not the new build. "
-                "Is /usr/local/bin before /usr/bin in PATH?")
-    smoke = subprocess.run(
-        [str(WANT_BIN), "-c", "import ssl,sqlite3,lzma; print('smoke ok')"],
-        capture_output=True, text=True, timeout=60,
-    )
-    if smoke.returncode != 0:
-        die(f"Install verification failed (stdlib smoke): {smoke.stderr[:500]}")
-    if not system_python_ok():
-        die("Install verification failed: system python broke (should be impossible).")
-    log.info("Installed %s (%s). System python untouched.", VERSION, ARCH_TAG)
-    return 0
+        if smoke.returncode != 0:
+            die(f"Install verification failed (stdlib smoke): {smoke.stderr[:500]}")
+        if not system_python_ok():
+            die("Install verification failed: system python broke (should be impossible).")
+        log.info("Installed %s (%s). System python untouched.", VERSION, ARCH_TAG)
+        return 0
 
 
 def cmd_uninstall(_args: argparse.Namespace) -> int:
     """Remove ONLY the dusky /usr/local install. /usr/bin is never touched."""
+    ensure_system_interpreter()
     ensure_root()
-    marker = read_marker()
-    remove_shadow(marker)  # restores any pre-existing foreign symlinks
-    targets: list[Path] = []
-    if marker:
-        for rel in marker.get("files", []):
-            p = PREFIX / rel
-            # Hard guard: everything must stay under /usr/local.
-            if PREFIX not in p.resolve().parents and p.resolve() != PREFIX:
-                die(f"Refusing to remove path escaping {PREFIX}: {p}")
-            targets.append(p)
-    else:
-        log.info("No marker; removing known %s paths only.", VERSION)
-        targets = [
-            PREFIX / "bin" / "python3.15",
-            PREFIX / "bin" / "python3.15-config",
-            PREFIX / "bin" / "idle3.15",
-            PREFIX / "bin" / "pydoc3.15",
-            PREFIX / "lib" / "python3.15",
-            PREFIX / "lib" / "libpython3.15.a",
-            PREFIX / "lib" / "pkgconfig" / "python-3.15.pc",
-            PREFIX / "lib" / "pkgconfig" / "python-3.15-embed.pc",
-            PREFIX / "include" / "python3.15",
-            PREFIX / "share" / "man" / "man1" / "python3.15.1",
-        ]
-    for p in targets:
-        try:
-            if p.is_symlink() or p.is_file():
-                p.unlink()
-                log.info("removed %s", p)
-            elif p.is_dir():
-                try:
-                    p.rmdir()  # only if already empty
+    with install_lock():
+        marker = read_marker()
+        remove_shadow(marker)  # restores any pre-existing foreign symlinks
+        targets: list[Path] = []
+        if marker:
+            for rel in marker.get("files", []):
+                p = PREFIX / rel
+                # Hard guard: everything must stay under /usr/local.
+                if PREFIX not in p.resolve().parents and p.resolve() != PREFIX:
+                    die(f"Refusing to remove path escaping {PREFIX}: {p}")
+                targets.append(p)
+        else:
+            log.info("No marker; removing known %s paths only.", VERSION)
+            targets = [
+                PREFIX / "bin" / "python3.15",
+                PREFIX / "bin" / "python3.15-config",
+                PREFIX / "bin" / "idle3.15",
+                PREFIX / "bin" / "pydoc3.15",
+                PREFIX / "lib" / "python3.15",
+                PREFIX / "lib" / "libpython3.15.a",
+                PREFIX / "lib" / "pkgconfig" / "python-3.15.pc",
+                PREFIX / "lib" / "pkgconfig" / "python-3.15-embed.pc",
+                PREFIX / "include" / "python3.15",
+                PREFIX / "share" / "man" / "man1" / "python3.15.1",
+            ]
+        for p in targets:
+            try:
+                if p.is_symlink() or p.is_file():
+                    p.unlink()
                     log.info("removed %s", p)
-                except OSError:
-                    # Directory with untracked content: remove the known
-                    # 3.15 tree explicitly, never blindly recursive elsewhere.
-                    if p == PREFIX / "lib" / "python3.15":
-                        shutil.rmtree(p)
-                        log.info("removed tree %s", p)
-        except OSError as exc:
-            log.warning("Could not remove %s: %s", p, exc)
-    try:
-        MARKER.unlink()
-    except OSError:
-        pass
-    # Prune the one dir we own if now empty; never PREFIX itself.
-    for owned in (PREFIX / "lib" / "python3.15", PREFIX / "include" / "python3.15"):
-        if owned.is_dir():
-            shutil.rmtree(owned, ignore_errors=True)
-    if not system_python_ok():
-        die("System python broken after uninstall (should be impossible).")
-    log.info("Uninstalled dusky-python. System python untouched.")
-    return 0
+                elif p.is_dir():
+                    try:
+                        p.rmdir()  # only if already empty
+                        log.info("removed %s", p)
+                    except OSError:
+                        # Directory with untracked content: remove the known
+                        # 3.15 tree explicitly, never blindly recursive elsewhere.
+                        if p == PREFIX / "lib" / "python3.15":
+                            shutil.rmtree(p)
+                            log.info("removed tree %s", p)
+            except OSError as exc:
+                log.warning("Could not remove %s: %s", p, exc)
+        try:
+            MARKER.unlink()
+        except OSError:
+            pass
+        # Prune the one dir we own if now empty; never PREFIX itself.
+        for owned in (PREFIX / "lib" / "python3.15", PREFIX / "include" / "python3.15"):
+            if owned.is_dir():
+                shutil.rmtree(owned, ignore_errors=True)
+        if not system_python_ok():
+            die("System python broken after uninstall (should be impossible).")
+        log.info("Uninstalled dusky-python. System python untouched.")
+        return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -447,7 +510,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--checksum", default="",
                     help="Expected sha256 of the tarball (else fetched from <url>.sha256).")
     ap.add_argument("-v", "--verbose", action="store_true")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.add_argument("--undo", action="store_true",
+                    help="Undo everything this script did (same as `uninstall`). "
+                         "Use when official 3.15 arrives via pacman.")
+    sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("check", help="Report state; never modifies anything.")
     ins = sub.add_parser("install", help="Install (no-op if already installed).")
     ins.add_argument("--reinstall", action="store_true",
@@ -455,7 +521,8 @@ def build_parser() -> argparse.ArgumentParser:
     ins.add_argument("--no-default", action="store_true",
                      help="Don't shadow /usr/local/bin/python{,3}; "
                           "PATH `python` stays on system 3.14.")
-    sub.add_parser("uninstall", help="Remove the dusky /usr/local install only.")
+    sub.add_parser("uninstall", aliases=["undo"],
+                     help="Remove the dusky /usr/local install only.")
     return ap
 
 
@@ -465,13 +532,13 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s: %(message)s",
     )
+    if args.undo or args.cmd in ("uninstall", "undo"):
+        return cmd_uninstall(args)
     if args.cmd == "check":
         return cmd_check(args)
     if args.cmd == "install":
         return cmd_install(args)
-    if args.cmd == "uninstall":
-        return cmd_uninstall(args)
-    raise AssertionError("unreachable")
+    return cmd_check(args)
 
 
 if __name__ == "__main__":

@@ -14,8 +14,11 @@ python --version   # 3.15.0rc3 (via /usr/local/bin shadow)
 ```
 
 Idempotent: re-running `install` is a no-op when the wanted version is present.
-`--reinstall` forces, `uninstall` removes only the dusky tree, `--no-default`
-skips the `python`/`python3` PATH shadow.
+`--reinstall` forces, `uninstall` (or `--undo`) removes only the dusky tree,
+`--no-default` skips the `python`/`python3` PATH shadow.
+
+When official 3.15 arrives via pacman: `sudo python3 python_rc3_install.py --undo`
+removes every trace, then `sudo pacman -S python` takes over.
 
 ## Release assets
 
