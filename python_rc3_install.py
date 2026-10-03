@@ -36,6 +36,7 @@ VERSION = "3.15.0rc3"
 ARCH_TAG = "x86_64-generic"  # -march=x86-64 -mtune=generic: any 64-bit CPU
 REPO = "dusklinux/dusky_python"
 TAG = f"v{VERSION}"
+BASE_URL = "https://github.com"
 ASSET = f"dusky-python-{VERSION}-{ARCH_TAG}.tar.gz"
 PREFIX = Path("/usr/local")
 MARKER = PREFIX / "lib" / "dusky-python.json"
@@ -50,8 +51,8 @@ STAGING_BYTES_NEEDED = 1_500_000_000  # PGO-built tree + tarball headroom
 log = logging.getLogger("dusky-python")
 
 
-def asset_url(tag: str = TAG, repo: str = REPO) -> str:
-    return f"https://github.com/{repo}/releases/download/{tag}/{ASSET}"
+def asset_url(tag: str = TAG, repo: str = REPO, base: str = BASE_URL) -> str:
+    return f"{base}/{repo}/releases/download/{tag}/{ASSET}"
 
 
 def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
@@ -289,7 +290,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="dusky-python-"))
     try:
         check_staging_space(tmp)
-        url = asset_url(args.tag, args.repo)
+        url = asset_url(args.tag, args.repo, args.base_url)
         tarball = tmp / ASSET
         download(url, tarball)
         expected = args.checksum or fetch_expected_sha256(url)
@@ -418,6 +419,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument("--repo", default=REPO)
     ap.add_argument("--tag", default=TAG)
+    ap.add_argument("--base-url", default=BASE_URL,
+                    help="Mirror root (default: github). Must serve "
+                         "<repo>/releases/download/<tag>/<asset>[.sha256].")
     ap.add_argument("--checksum", default="",
                     help="Expected sha256 of the tarball (else fetched from <url>.sha256).")
     ap.add_argument("-v", "--verbose", action="store_true")
