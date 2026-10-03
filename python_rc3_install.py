@@ -270,6 +270,14 @@ def remove_shadow(marker: dict | None) -> None:
             log.info("restored %s -> %s", link, backed_up[name])
 
 
+def shadow_active() -> bool:
+    return all(
+        (PREFIX / "bin" / name).is_symlink()
+        and os.readlink(PREFIX / "bin" / name) == target
+        for name, target in SHADOW_LINKS.items()
+    )
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     if not is_arch():
         die("Refusing: this installer is Arch Linux only.")
@@ -277,7 +285,21 @@ def cmd_install(args: argparse.Namespace) -> int:
         die(f"Refusing: system python {SYSTEM_PYTHON} is broken or missing.")
     state = current_state()
     if state.installed and not args.reinstall:
-        log.info("Already installed: %s (%s). Nothing to do.", VERSION, ARCH_TAG)
+        # Converge shadow state even on no-op (flag may differ from last run).
+        want_shadow = not args.no_default
+        if want_shadow != shadow_active():
+            ensure_root()
+            marker = read_marker() or {}
+            if want_shadow:
+                shadow = apply_shadow()
+            else:
+                remove_shadow(marker)
+                shadow = {"links": [], "backed_up": {}}
+            marker["shadow"] = shadow
+            MARKER.write_text(json.dumps(marker, indent=2))
+            log.info("Shadow %s.", "enabled" if want_shadow else "disabled")
+        else:
+            log.info("Already installed: %s (%s). Nothing to do.", VERSION, ARCH_TAG)
         return 0
     if state.marker or state.bin_version:
         log.info("Removing previous /usr/local install before reinstall...")
