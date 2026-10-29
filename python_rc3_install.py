@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Install the temporary CPython 3.15rc3 build on x86-64 Arch Linux.
+"""Install the temporary CPython 3.15 runtime on x86-64 Arch Linux.
 
 Run with the distro Python 3.14+; /usr/bin/python* is never modified.
     python_rc3_install.py [check]
@@ -21,8 +21,8 @@ The archive must contain a complete /usr/local runtime, including Python 3.15
 builds of PyGObject and pycairo. Installation never invokes pip or downloads
 dependencies. GTK 4 and the native libraries required by the build must already
 be installed. Absolute /usr/bin/python3 launchers keep using the distro Python.
-An already selected Python 3.15 or newer is checked and retained on a normal
-install; it is never replaced by the older RC3 archive.
+An already selected, unmanaged compatible Python 3.15 or newer is checked and
+retained on a normal install. Managed older builds are upgraded.
 Keep this bootstrap script parseable by Python 3.14 so install and undo work
 before the distro upgrade; Python 3.15-only syntax belongs in the payload.
 """
@@ -50,7 +50,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import NoReturn
 
-VERSION = "3.15.0rc3"
+VERSION = "3.15.2"
 ARCH_TAG = "x86_64-generic"
 REPO = "dusklinux/dusky_python"
 TAG = f"v{VERSION}"
@@ -130,7 +130,9 @@ def read_marker() -> dict | None:
         die(f"Invalid installation marker {MARKER}: {exc}")
     if not isinstance(data, dict) or not isinstance(data.get("files"), list):
         die(f"Invalid installation marker: {MARKER}")
-    if data.get("version") != VERSION or data.get("arch") != ARCH_TAG:
+    version = data.get("version")
+    if (not isinstance(version, str) or not re.fullmatch(r"3\.15\.\d+(?:rc\d+)?", version)
+            or data.get("arch") != ARCH_TAG):
         die(f"Installation marker belongs to a different build: {MARKER}")
     for rel in data["files"]:
         if not isinstance(rel, str):
@@ -407,13 +409,21 @@ def cmd_install(args: argparse.Namespace) -> int:
         die("This build requires Arch Linux.")
     if os.uname().machine != "x86_64":
         die("This release asset supports x86-64 only.")
-    if not (args.reinstall or args.force or args.no_default or args.tarball):
+    marker = read_marker()
+    if marker and tuple(map(int, re.match(r"(\d+)\.(\d+)\.(\d+)", marker["version"]).groups())) > tuple(map(int, VERSION.split('.'))):
+        die(f"Managed Python {marker['version']} is newer than {VERSION}; update this installer instead of downgrading.")
+    if marker is None and not (args.reinstall or args.force or args.no_default or args.tarball):
         selected = shutil.which("python3")
         if selected:
             info = run_python(Path(selected),
-                              "import sys; print(*sys.version_info[:3])")
-            parts = tuple(map(int, info.split()))
-            if len(parts) == 3 and parts >= (3, 15, 0):
+                              "import sys; print(*sys.version_info[:3], sys.version_info.releaselevel, sys.version_info.serial)")
+            major, minor, micro, level, serial = info.split()
+            parts = (int(major), int(minor), int(micro))
+            compatible = parts > (3, 15, 0) or (
+                parts == (3, 15, 0) and
+                (level == "final" or (level == "candidate" and int(serial) >= 3))
+            )
+            if compatible:
                 run_python(Path(selected), STDLIB_PROBE)
                 run_python(Path(selected), DESKTOP_PROBE)
                 run_python(Path(selected), UPDATER_PROBE)
@@ -424,9 +434,12 @@ def cmd_install(args: argparse.Namespace) -> int:
                       "import sys; print(*sys.version_info[:2], sys.version_info.releaselevel)")
     major, minor, level = info.split()
     if (int(major), int(minor)) >= (3, 15) and level == "final":
-        die("Distro Python is already stable 3.15+. Run --undo to use it.")
-    marker = read_marker()
-    if marker and not args.reinstall:
+        if marker:
+            log.warning("Distro Python is already stable 3.15+. Run --undo after the updater exits to use it.")
+        else:
+            log.info("Distro Python is already stable 3.15+; no temporary installation is needed.")
+        return 0
+    if marker and marker.get("version") == VERSION and not args.reinstall:
         verify_runtime(WANT_BIN)
         with transaction() as tx:
             set_shadow(marker, not args.no_default, tx)
